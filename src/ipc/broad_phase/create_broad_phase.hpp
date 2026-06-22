@@ -11,7 +11,8 @@ enum class BroadPhaseMethod : uint8_t {
     SPATIAL_HASH,
     LBVH,
     SWEEP_AND_PRUNE,
-    SWEEP_AND_TINIEST_QUEUE
+    SWEEP_AND_TINIEST_QUEUE,
+    GPU_LBVH
 };
 
 std::shared_ptr<BroadPhase>
