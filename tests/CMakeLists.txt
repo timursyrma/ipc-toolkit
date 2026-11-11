@@ -110,6 +110,27 @@ endif()
 # Register tests
 ################################################################################
 
+add_executable(bench_gpu_lbvh src/bench_gpu_lbvh.cpp)
+target_link_libraries(bench_gpu_lbvh PRIVATE ipc::toolkit igl::core TBB::tbb)
+target_include_directories(bench_gpu_lbvh PRIVATE "${IPC_TOOLKIT_TESTS_INCLUDE_DIR}")
+if(IPC_TOOLKIT_WITH_CUDA)
+  set_target_properties(bench_gpu_lbvh PROPERTIES CUDA_ARCHITECTURES "native")
+endif()
+
+add_executable(bench_real_scenes src/bench_real_scenes.cpp)
+target_link_libraries(bench_real_scenes PRIVATE ipc::toolkit igl::core TBB::tbb)
+target_include_directories(bench_real_scenes PRIVATE "${IPC_TOOLKIT_TESTS_INCLUDE_DIR}")
+if(IPC_TOOLKIT_WITH_CUDA)
+  set_target_properties(bench_real_scenes PROPERTIES CUDA_ARCHITECTURES "native")
+endif()
+
+add_executable(bench_candidate_waste src/bench_candidate_waste.cpp)
+target_link_libraries(bench_candidate_waste PRIVATE ipc::toolkit igl::core TBB::tbb)
+target_include_directories(bench_candidate_waste PRIVATE "${IPC_TOOLKIT_TESTS_INCLUDE_DIR}")
+if(IPC_TOOLKIT_WITH_CUDA)
+  set_target_properties(bench_candidate_waste PROPERTIES CUDA_ARCHITECTURES "native")
+endif()
+
 FetchContent_GetProperties(catch2)
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)

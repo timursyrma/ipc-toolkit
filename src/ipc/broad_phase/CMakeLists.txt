@@ -8,6 +8,8 @@ set(SOURCES
   create_broad_phase.cpp
   create_broad_phase.hpp
   default_broad_phase.hpp
+  gpu_lbvh.cu
+  gpu_lbvh.hpp
   hash_grid.cpp
   hash_grid.hpp
   lbvh.cpp
