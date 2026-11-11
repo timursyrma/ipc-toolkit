@@ -261,10 +261,10 @@ __global__ void traverse_lbvh_kernel(
             int32_t eb0 = edge_v0[id_b], eb1 = edge_v1[id_b];
             if (ea0 == eb0 || ea0 == eb1 || ea1 == eb0 || ea1 == eb1) return;
         } else if (filter_type == 3) {
-            if (id_b == face_v0[id_a] || id_b == face_v1[id_a] || id_b == face_v2[id_a]) return;
+            if (id_a == face_v0[id_b] || id_a == face_v1[id_b] || id_a == face_v2[id_b]) return;
         } else if (filter_type == 4) {
-            int32_t e0 = edge_v0[id_a], e1 = edge_v1[id_a];
-            int32_t f0 = face_v0[id_b], f1 = face_v1[id_b], f2 = face_v2[id_b];
+            int32_t e0 = edge_v0[id_b], e1 = edge_v1[id_b];
+            int32_t f0 = face_v0[id_a], f1 = face_v1[id_a], f2 = face_v2[id_a];
             if (e0 == f0 || e0 == f1 || e0 == f2 || e1 == f0 || e1 == f1 || e1 == f2) return;
         } else if (filter_type == 5) {
             int32_t fa0 = face_v0[id_a], fa1 = face_v1[id_a], fa2 = face_v2[id_a];
