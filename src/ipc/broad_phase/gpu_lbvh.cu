@@ -17,6 +17,8 @@
 #include <thrust/scan.h>
 #include <thrust/copy.h>
 #include <thrust/gather.h>
+#include <thrust/reduce.h>
+#include <thrust/fill.h>
 
 #include <algorithm>
 #include <vector>
@@ -47,6 +49,276 @@ __device__ __host__ inline bool gpu_nodes_intersect(const GpuNode& a, const GpuN
     return a.aabb_min_x <= b.aabb_max_x && b.aabb_min_x <= a.aabb_max_x
         && a.aabb_min_y <= b.aabb_max_y && b.aabb_min_y <= a.aabb_max_y
         && a.aabb_min_z <= b.aabb_max_z && b.aabb_min_z <= a.aabb_max_z;
+}
+
+// Squared distance between segments [p1,q1] and [p2,q2] (Ericson,
+// "Real-Time Collision Detection", 5.1.9). Used by the exact EE culling:
+// capsule-vs-capsule test at the leaf level is exactly this distance
+// against dhat.
+//
+// Computed in double: the closest-point parameters come out of
+// denom = a*e - b*b, which catastrophically cancels in float for short
+// near-parallel edges (small dhat regime), overestimating the distance and
+// culling live pairs. Doubles only run for leaf pairs that already passed
+// the AABB test, so the FP64 throughput penalty is negligible against the
+// memory-bound traversal.
+// Float version: cheap, but its closest-point parameters can be off for
+// short near-parallel edges, so its value is only trusted far from the
+// threshold (see ee_culled()).
+__device__ inline float seg_seg_dist_sq_f(
+    const float3 p1, const float3 q1, const float3 p2, const float3 q2)
+{
+    const float3 d1 = { q1.x - p1.x, q1.y - p1.y, q1.z - p1.z };
+    const float3 d2 = { q2.x - p2.x, q2.y - p2.y, q2.z - p2.z };
+    const float3 r = { p1.x - p2.x, p1.y - p2.y, p1.z - p2.z };
+    const float a = d1.x * d1.x + d1.y * d1.y + d1.z * d1.z;
+    const float e = d2.x * d2.x + d2.y * d2.y + d2.z * d2.z;
+    const float f = d2.x * r.x + d2.y * r.y + d2.z * r.z;
+
+    float s, t;
+    constexpr float EPS = 1e-20f;
+    if (a <= EPS && e <= EPS) {
+        s = t = 0.0f;
+    } else if (a <= EPS) {
+        s = 0.0f;
+        t = fminf(fmaxf(f / e, 0.0f), 1.0f);
+    } else {
+        const float c = d1.x * r.x + d1.y * r.y + d1.z * r.z;
+        if (e <= EPS) {
+            t = 0.0f;
+            s = fminf(fmaxf(-c / a, 0.0f), 1.0f);
+        } else {
+            const float b = d1.x * d2.x + d1.y * d2.y + d1.z * d2.z;
+            const float denom = a * e - b * b;
+            s = denom > EPS
+                ? fminf(fmaxf((b * f - c * e) / denom, 0.0f), 1.0f)
+                : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f) {
+                t = 0.0f;
+                s = fminf(fmaxf(-c / a, 0.0f), 1.0f);
+            } else if (t > 1.0f) {
+                t = 1.0f;
+                s = fminf(fmaxf((b - c) / a, 0.0f), 1.0f);
+            }
+        }
+    }
+
+    const float3 c1 = { p1.x + d1.x * s, p1.y + d1.y * s, p1.z + d1.z * s };
+    const float3 c2 = { p2.x + d2.x * t, p2.y + d2.y * t, p2.z + d2.z * t };
+    const float3 v = { c1.x - c2.x, c1.y - c2.y, c1.z - c2.z };
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}
+
+__device__ inline double seg_seg_dist_sq(
+    const float3 p1f, const float3 q1f, const float3 p2f, const float3 q2f)
+{
+    const double3 p1 = { p1f.x, p1f.y, p1f.z };
+    const double3 q1 = { q1f.x, q1f.y, q1f.z };
+    const double3 p2 = { p2f.x, p2f.y, p2f.z };
+    const double3 q2 = { q2f.x, q2f.y, q2f.z };
+
+    const double3 d1 = { q1.x - p1.x, q1.y - p1.y, q1.z - p1.z };
+    const double3 d2 = { q2.x - p2.x, q2.y - p2.y, q2.z - p2.z };
+    const double3 r = { p1.x - p2.x, p1.y - p2.y, p1.z - p2.z };
+    const double a = d1.x * d1.x + d1.y * d1.y + d1.z * d1.z;
+    const double e = d2.x * d2.x + d2.y * d2.y + d2.z * d2.z;
+    const double f = d2.x * r.x + d2.y * r.y + d2.z * r.z;
+
+    double s, t;
+    constexpr double EPS = 1e-30;
+    if (a <= EPS && e <= EPS) {
+        s = t = 0.0;
+    } else if (a <= EPS) {
+        s = 0.0;
+        t = fmin(fmax(f / e, 0.0), 1.0);
+    } else {
+        const double c = d1.x * r.x + d1.y * r.y + d1.z * r.z;
+        if (e <= EPS) {
+            t = 0.0;
+            s = fmin(fmax(-c / a, 0.0), 1.0);
+        } else {
+            const double b = d1.x * d2.x + d1.y * d2.y + d1.z * d2.z;
+            const double denom = a * e - b * b;
+            s = denom > EPS ? fmin(fmax((b * f - c * e) / denom, 0.0), 1.0)
+                            : 0.0;
+            t = (b * s + f) / e;
+            if (t < 0.0) {
+                t = 0.0;
+                s = fmin(fmax(-c / a, 0.0), 1.0);
+            } else if (t > 1.0) {
+                t = 1.0;
+                s = fmin(fmax((b - c) / a, 0.0), 1.0);
+            }
+        }
+    }
+
+    const double3 c1 = { p1.x + d1.x * s, p1.y + d1.y * s, p1.z + d1.z * s };
+    const double3 c2 = { p2.x + d2.x * t, p2.y + d2.y * t, p2.z + d2.z * t };
+    const double3 v = { c1.x - c2.x, c1.y - c2.y, c1.z - c2.z };
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}
+
+// Two-stage EE cull: the float distance decides only when it is at least
+// 2x the threshold (4x in squared terms) -- far outside its observed error
+// -- and the uncertainty band falls through to the double computation.
+// TODO(research): replace the 2x guard band with a certified forward error
+// bound on the float closest-point computation.
+__device__ inline bool ee_culled(
+    const float3 p1, const float3 q1, const float3 p2, const float3 q2,
+    const float cull_sq)
+{
+    const float d_f = seg_seg_dist_sq_f(p1, q1, p2, q2);
+    if (d_f <= cull_sq) {
+        return false; // emitting extra is always safe
+    }
+    if (d_f > 4.0f * cull_sq) {
+        return true; // far beyond the float error band
+    }
+    return seg_seg_dist_sq(p1, q1, p2, q2) > double(cull_sq);
+}
+
+// Point-point: a plain difference of squares has no parameter search, so
+// the float error is tiny and the host-side threshold margin covers it.
+__device__ inline bool vv_culled(
+    const float3 p, const float3 q, const float cull_sq)
+{
+    const float3 v = { p.x - q.x, p.y - q.y, p.z - q.z };
+    return v.x * v.x + v.y * v.y + v.z * v.z > cull_sq;
+}
+
+// Point-segment squared distance (scalar-templated: float fast path,
+// double for the uncertainty band).
+template <typename T>
+__device__ inline T pt_seg_dist_sq_t(
+    const float3 pf, const float3 af, const float3 bf)
+{
+    const T px = pf.x, py = pf.y, pz = pf.z;
+    const T ax = af.x, ay = af.y, az = af.z;
+    const T dx = T(bf.x) - ax, dy = T(bf.y) - ay, dz = T(bf.z) - az;
+    const T len_sq = dx * dx + dy * dy + dz * dz;
+    T t = len_sq > T(0)
+        ? ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / len_sq
+        : T(0);
+    t = min(max(t, T(0)), T(1));
+    const T vx = px - (ax + t * dx), vy = py - (ay + t * dy),
+            vz = pz - (az + t * dz);
+    return vx * vx + vy * vy + vz * vz;
+}
+
+__device__ inline bool ev_culled(
+    const float3 p, const float3 a, const float3 b, const float cull_sq)
+{
+    const float d_f = pt_seg_dist_sq_t<float>(p, a, b);
+    if (d_f <= cull_sq) {
+        return false;
+    }
+    if (d_f > 4.0f * cull_sq) {
+        return true;
+    }
+    return pt_seg_dist_sq_t<double>(p, a, b) > double(cull_sq);
+}
+
+// Point-triangle squared distance (Ericson, "Real-Time Collision
+// Detection", 5.1.5), scalar-templated like pt_seg_dist_sq_t.
+template <typename T>
+__device__ inline T pt_tri_dist_sq_t(
+    const float3 pf, const float3 af, const float3 bf, const float3 cf)
+{
+    const T px = pf.x, py = pf.y, pz = pf.z;
+    const T ax = af.x, ay = af.y, az = af.z;
+    const T abx = T(bf.x) - ax, aby = T(bf.y) - ay, abz = T(bf.z) - az;
+    const T acx = T(cf.x) - ax, acy = T(cf.y) - ay, acz = T(cf.z) - az;
+    const T apx = px - ax, apy = py - ay, apz = pz - az;
+
+    const T d1 = abx * apx + aby * apy + abz * apz;
+    const T d2 = acx * apx + acy * apy + acz * apz;
+
+    T qx, qy, qz; // closest point
+    if (d1 <= T(0) && d2 <= T(0)) {
+        qx = ax, qy = ay, qz = az; // region A
+    } else {
+        const T bpx = px - T(bf.x), bpy = py - T(bf.y), bpz = pz - T(bf.z);
+        const T d3 = abx * bpx + aby * bpy + abz * bpz;
+        const T d4 = acx * bpx + acy * bpy + acz * bpz;
+        if (d3 >= T(0) && d4 <= d3) {
+            qx = bf.x, qy = bf.y, qz = bf.z; // region B
+        } else {
+            const T cpx = px - T(cf.x), cpy = py - T(cf.y),
+                    cpz = pz - T(cf.z);
+            const T d5 = abx * cpx + aby * cpy + abz * cpz;
+            const T d6 = acx * cpx + acy * cpy + acz * cpz;
+            const T vc = d1 * d4 - d3 * d2;
+            const T vb = d5 * d2 - d1 * d6;
+            const T va = d3 * d6 - d5 * d4;
+            if (d6 >= T(0) && d5 <= d6) {
+                qx = cf.x, qy = cf.y, qz = cf.z; // region C
+            } else if (vc <= T(0) && d1 >= T(0) && d3 <= T(0)) {
+                const T v = d1 / (d1 - d3); // edge AB
+                qx = ax + v * abx, qy = ay + v * aby, qz = az + v * abz;
+            } else if (vb <= T(0) && d2 >= T(0) && d6 <= T(0)) {
+                const T w = d2 / (d2 - d6); // edge AC
+                qx = ax + w * acx, qy = ay + w * acy, qz = az + w * acz;
+            } else if (va <= T(0) && (d4 - d3) >= T(0) && (d5 - d6) >= T(0)) {
+                const T w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); // edge BC
+                qx = T(bf.x) + w * (T(cf.x) - T(bf.x));
+                qy = T(bf.y) + w * (T(cf.y) - T(bf.y));
+                qz = T(bf.z) + w * (T(cf.z) - T(bf.z));
+            } else {
+                const T denom = T(1) / (va + vb + vc); // interior
+                const T v = vb * denom, w = vc * denom;
+                qx = ax + abx * v + acx * w;
+                qy = ay + aby * v + acy * w;
+                qz = az + abz * v + acz * w;
+            }
+        }
+    }
+
+    const T vx = px - qx, vy = py - qy, vz = pz - qz;
+    return vx * vx + vy * vy + vz * vz;
+}
+
+__device__ inline bool fv_culled(
+    const float3 p, const float3 a, const float3 b, const float3 c,
+    const float cull_sq)
+{
+    const float d_f = pt_tri_dist_sq_t<float>(p, a, b, c);
+    if (d_f <= cull_sq) {
+        return false;
+    }
+    if (d_f > 4.0f * cull_sq) {
+        return true;
+    }
+    return pt_tri_dist_sq_t<double>(p, a, b, c) > double(cull_sq);
+}
+
+// Distance-aware node descent. The node boxes are inflated by dhat/2 on
+// each side, so the uninflated per-axis gap is the inflated separation
+// plus dhat; the Euclidean combination of the positive gaps lower-bounds
+// the primitive distance, and a lower bound above dhat prunes the whole
+// subtree. Strictly stronger than the plain overlap test (which only
+// prunes when a single axis separates): boxes diagonal from each other
+// get culled here even though every axis gap individually is below dhat.
+__device__ inline bool gpu_nodes_within(
+    const GpuNode& a, const GpuNode& b, const float dhat)
+{
+    float d2 = 0.0f, s;
+    s = fmaxf(a.aabb_min_x - b.aabb_max_x, b.aabb_min_x - a.aabb_max_x)
+        + dhat;
+    if (s > 0.0f) {
+        d2 += s * s;
+    }
+    s = fmaxf(a.aabb_min_y - b.aabb_max_y, b.aabb_min_y - a.aabb_max_y)
+        + dhat;
+    if (s > 0.0f) {
+        d2 += s * s;
+    }
+    s = fmaxf(a.aabb_min_z - b.aabb_max_z, b.aabb_min_z - a.aabb_max_z)
+        + dhat;
+    if (s > 0.0f) {
+        d2 += s * s;
+    }
+    return d2 <= dhat * dhat;
 }
 
 __device__ inline uint64_t expand_bits_2(uint64_t v)
@@ -235,6 +507,8 @@ __global__ void traverse_lbvh_kernel(
     const int32_t* __restrict__ face_v1,
     const int32_t* __restrict__ face_v2,
     const int filter_type,
+    const float3* __restrict__ verts,
+    const float ee_cull_sq,
     const int32_t* __restrict__ offsets,
     int32_t* candidate_counts,
     CandidatePair* candidate_pairs)
@@ -260,6 +534,13 @@ __global__ void traverse_lbvh_kernel(
             int32_t ea0 = edge_v0[id_a], ea1 = edge_v1[id_a];
             int32_t eb0 = edge_v0[id_b], eb1 = edge_v1[id_b];
             if (ea0 == eb0 || ea0 == eb1 || ea1 == eb0 || ea1 == eb1) return;
+            // Exact dhat-culling: capsule-vs-capsule == segment distance.
+            if (ee_cull_sq >= 0.0f
+                && ee_culled(
+                       verts[ea0], verts[ea1], verts[eb0], verts[eb1],
+                       ee_cull_sq)) {
+                return;
+            }
         } else if (filter_type == 3) {
             if (id_a == face_v0[id_b] || id_a == face_v1[id_b] || id_a == face_v2[id_b]) return;
         } else if (filter_type == 4) {
@@ -325,6 +606,144 @@ __global__ void traverse_lbvh_kernel(
     candidate_counts[query_idx] = local_count;
 }
 
+template <bool triangular>
+__global__ void traverse_single_pass_kernel(
+    const GpuNode* __restrict__ source_bvh,
+    const GpuNode* __restrict__ target_bvh,
+    const int32_t* __restrict__ rightmost_leaves,
+    const int num_source_leaves,
+    const int source_leaf_offset,
+    const int num_target_nodes,
+    const int target_root,
+    const int32_t* __restrict__ edge_v0,
+    const int32_t* __restrict__ edge_v1,
+    const int32_t* __restrict__ face_v0,
+    const int32_t* __restrict__ face_v1,
+    const int32_t* __restrict__ face_v2,
+    const int filter_type,
+    const float3* __restrict__ verts,
+    const float ee_cull_sq,
+    CandidatePair* __restrict__ candidate_pairs,
+    int* __restrict__ global_counter,
+    const int max_pairs)
+{
+    const int query_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (query_idx >= num_source_leaves)
+        return;
+
+    const GpuNode& query = source_bvh[source_leaf_offset + query_idx];
+
+    constexpr int MAX_STACK = 64;
+    int stack[MAX_STACK];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = -1;
+
+    int node_idx = target_root;
+
+    // Distance-aware descent threshold: the squared cull threshold carries
+    // the host-side margin, so dhat here inherits it.
+    const float cull_dhat = ee_cull_sq >= 0.0f ? sqrtf(ee_cull_sq) : -1.0f;
+
+    auto try_emit = [&](int32_t id_a, int32_t id_b) {
+        if (filter_type == 0) {
+            if (ee_cull_sq >= 0.0f
+                && vv_culled(verts[id_a], verts[id_b], ee_cull_sq)) {
+                return;
+            }
+        } else if (filter_type == 1) {
+            if (id_b == edge_v0[id_a] || id_b == edge_v1[id_a]) return;
+            if (ee_cull_sq >= 0.0f
+                && ev_culled(
+                       verts[id_b], verts[edge_v0[id_a]],
+                       verts[edge_v1[id_a]], ee_cull_sq)) {
+                return;
+            }
+        } else if (filter_type == 2) {
+            int32_t ea0 = edge_v0[id_a], ea1 = edge_v1[id_a];
+            int32_t eb0 = edge_v0[id_b], eb1 = edge_v1[id_b];
+            if (ea0 == eb0 || ea0 == eb1 || ea1 == eb0 || ea1 == eb1) return;
+            // Exact dhat-culling: capsule-vs-capsule == segment distance.
+            if (ee_cull_sq >= 0.0f
+                && ee_culled(
+                       verts[ea0], verts[ea1], verts[eb0], verts[eb1],
+                       ee_cull_sq)) {
+                return;
+            }
+        } else if (filter_type == 3) {
+            if (id_a == face_v0[id_b] || id_a == face_v1[id_b] || id_a == face_v2[id_b]) return;
+            if (ee_cull_sq >= 0.0f
+                && fv_culled(
+                       verts[id_a], verts[face_v0[id_b]],
+                       verts[face_v1[id_b]], verts[face_v2[id_b]],
+                       ee_cull_sq)) {
+                return;
+            }
+        } else if (filter_type == 4) {
+            int32_t e0 = edge_v0[id_b], e1 = edge_v1[id_b];
+            int32_t f0 = face_v0[id_a], f1 = face_v1[id_a], f2 = face_v2[id_a];
+            if (e0 == f0 || e0 == f1 || e0 == f2 || e1 == f0 || e1 == f1 || e1 == f2) return;
+        } else if (filter_type == 5) {
+            int32_t fa0 = face_v0[id_a], fa1 = face_v1[id_a], fa2 = face_v2[id_a];
+            int32_t fb0 = face_v0[id_b], fb1 = face_v1[id_b], fb2 = face_v2[id_b];
+            if (fa0 == fb0 || fa0 == fb1 || fa0 == fb2 || fa1 == fb0 || fa1 == fb1 || fa1 == fb2
+                || fa2 == fb0 || fa2 == fb1 || fa2 == fb2) return;
+        }
+
+        int idx = atomicAdd(global_counter, 1);
+        if (idx < max_pairs) {
+            candidate_pairs[idx].id_a = id_a;
+            candidate_pairs[idx].id_b = id_b;
+        }
+    };
+
+    auto node_hit = [&](const GpuNode& a, const GpuNode& b) {
+        return cull_dhat >= 0.0f ? gpu_nodes_within(a, b, cull_dhat)
+                                 : gpu_nodes_intersect(a, b);
+    };
+
+    do {
+        if (num_target_nodes == 1) {
+            if (!triangular && node_hit(query, target_bvh[0])) {
+                try_emit(query.primitive_id, target_bvh[0].primitive_id);
+            }
+            break;
+        }
+
+        const GpuNode& node = target_bvh[node_idx];
+        const GpuNode& child_l = target_bvh[node.left];
+        const GpuNode& child_r = target_bvh[node.right];
+
+        bool intersects_l = node_hit(query, child_l);
+        bool intersects_r = node_hit(query, child_r);
+
+        if constexpr (triangular) {
+            if (intersects_l && rightmost_leaves[node.left] <= query_idx)
+                intersects_l = false;
+            if (intersects_r && rightmost_leaves[node.right] <= query_idx)
+                intersects_r = false;
+        }
+
+        if (intersects_l && gpu_node_is_leaf(child_l)) {
+            try_emit(query.primitive_id, child_l.primitive_id);
+        }
+        if (intersects_r && gpu_node_is_leaf(child_r)) {
+            try_emit(query.primitive_id, child_r.primitive_id);
+        }
+
+        bool traverse_l = intersects_l && gpu_node_is_inner(child_l);
+        bool traverse_r = intersects_r && gpu_node_is_inner(child_r);
+
+        if (!traverse_l && !traverse_r) {
+            node_idx = stack[--stack_ptr];
+        } else {
+            node_idx = traverse_l ? node.left : node.right;
+            if (traverse_l && traverse_r) {
+                stack[stack_ptr++] = node.right;
+            }
+        }
+    } while (node_idx != -1);
+}
+
 } // anonymous namespace
 
 struct GPU_LBVH::Impl {
@@ -354,9 +773,20 @@ struct GPU_LBVH::Impl {
     bool has_faces = false;
     uint8_t dim = 0;
 
+    // Exact EE dhat-culling (see GPU_LBVH::exact_ee_culling). Set by the
+    // protected build from the state staged by the public static build();
+    // any other build path leaves it disabled.
+    thrust::device_vector<float3> d_verts;
+    float ee_cull_sq = -1.0f; ///< Active threshold; < 0 disables.
+
     int32_t vertex_root = 0;
     int32_t edge_root = 0;
     int32_t face_root = 0;
+
+    mutable thrust::device_vector<int32_t> d_counts;
+    mutable thrust::device_vector<int32_t> d_offsets;
+    mutable thrust::device_vector<CandidatePair> d_pairs;
+    mutable thrust::device_vector<int> d_single_counter;
 
     void build_bvh(
         const AABBs& boxes,
@@ -489,6 +919,8 @@ struct GPU_LBVH::Impl {
                 d_face_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v1.data()),
                 d_face_v2.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v2.data()),
                 filter_type,
+                d_verts.empty() ? nullptr : thrust::raw_pointer_cast(d_verts.data()),
+                (filter_type <= 3 && !d_verts.empty()) ? ee_cull_sq : -1.0f,
                 d_offsets,
                 d_counts,
                 nullptr);
@@ -504,10 +936,48 @@ struct GPU_LBVH::Impl {
                 d_face_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v1.data()),
                 d_face_v2.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v2.data()),
                 filter_type,
+                d_verts.empty() ? nullptr : thrust::raw_pointer_cast(d_verts.data()),
+                (filter_type <= 3 && !d_verts.empty()) ? ee_cull_sq : -1.0f,
                 d_offsets,
                 d_counts,
                 d_pairs);
         }
+        cudaDeviceSynchronize();
+    }
+
+    template <bool triangular>
+    void launch_single_pass(
+        const thrust::device_vector<GpuNode>& source,
+        const thrust::device_vector<GpuNode>& target,
+        const thrust::device_vector<int32_t>& rightmost,
+        int target_root,
+        int filter_type,
+        CandidatePair* d_pairs,
+        int* d_counter,
+        int max_pairs) const
+    {
+        const int source_leaf_offset = source.size() / 2;
+        const int num_source_leaves = source_leaf_offset + 1;
+        const int num_target_nodes = target.size();
+        const int block = 256;
+        const int grid = (num_source_leaves + block - 1) / block;
+
+        traverse_single_pass_kernel<triangular><<<grid, block>>>(
+            thrust::raw_pointer_cast(source.data()),
+            thrust::raw_pointer_cast(target.data()),
+            thrust::raw_pointer_cast(rightmost.data()),
+            num_source_leaves, source_leaf_offset, num_target_nodes, target_root,
+            d_edge_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v0.data()),
+            d_edge_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v1.data()),
+            d_face_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v0.data()),
+            d_face_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v1.data()),
+            d_face_v2.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v2.data()),
+            filter_type,
+            d_verts.empty() ? nullptr : thrust::raw_pointer_cast(d_verts.data()),
+            (filter_type <= 3 && !d_verts.empty()) ? ee_cull_sq : -1.0f,
+            d_pairs,
+            d_counter,
+            max_pairs);
         cudaDeviceSynchronize();
     }
 
@@ -525,8 +995,9 @@ struct GPU_LBVH::Impl {
         const int source_leaf_offset = source.size() / 2;
         const int num_source_leaves = source_leaf_offset + 1;
 
-        thrust::device_vector<int32_t> d_counts(num_source_leaves, 0);
-        thrust::device_vector<int32_t> d_offsets(num_source_leaves, 0);
+        d_counts.resize(num_source_leaves);
+        d_offsets.resize(num_source_leaves);
+        thrust::fill(d_counts.begin(), d_counts.end(), 0);
 
         if (triangular) {
             launch_traverse<true>(source, target, rightmost, target_root, filter_type,
@@ -542,16 +1013,12 @@ struct GPU_LBVH::Impl {
 
         thrust::exclusive_scan(d_counts.begin(), d_counts.end(), d_offsets.begin());
 
-        thrust::host_vector<int32_t> h_counts = d_counts;
-        int total = 0;
-        for (int i = 0; i < num_source_leaves; i++) {
-            total += h_counts[i];
-        }
+        int total = thrust::reduce(d_counts.begin(), d_counts.end(), 0, thrust::plus<int>());
 
         if (total == 0)
             return {};
 
-        thrust::device_vector<CandidatePair> d_pairs(total);
+        d_pairs.resize(total);
 
         if (triangular) {
             launch_traverse<true>(source, target, rightmost, target_root, filter_type,
@@ -568,6 +1035,68 @@ struct GPU_LBVH::Impl {
         thrust::host_vector<CandidatePair> h_pairs = d_pairs;
         return std::vector<CandidatePair>(h_pairs.begin(), h_pairs.end());
     }
+
+    /// Single-pass traversal: one kernel launch writing through a global
+    /// atomic counter, instead of the count + write passes of traverse().
+    /// The buffer starts at its high-water mark (or 8 pairs per leaf) and
+    /// the kernel keeps counting past capacity, so an overflow re-runs once
+    /// with the exact size; steady-state is a single pass. Used for the
+    /// exact-culled EE path, where repeating the distance test in a second
+    /// pass would double the most expensive part of the traversal.
+    std::vector<CandidatePair> traverse_single(
+        const thrust::device_vector<GpuNode>& source,
+        const thrust::device_vector<GpuNode>& target,
+        const thrust::device_vector<int32_t>& rightmost,
+        int target_root,
+        bool triangular,
+        int filter_type) const
+    {
+        if (source.empty() || target.empty())
+            return {};
+
+        const int source_leaf_offset = source.size() / 2;
+        const int num_source_leaves = source_leaf_offset + 1;
+
+        size_t capacity = std::max(
+            { d_pairs.capacity(), size_t(1024),
+              size_t(8) * size_t(num_source_leaves) });
+        d_single_counter.resize(1);
+
+        int count = 0;
+        for (int pass = 0; pass < 2; ++pass) {
+            if (d_pairs.size() < capacity)
+                d_pairs.resize(capacity);
+            thrust::fill(
+                d_single_counter.begin(), d_single_counter.end(), 0);
+
+            if (triangular) {
+                launch_single_pass<true>(
+                    source, target, rightmost, target_root, filter_type,
+                    thrust::raw_pointer_cast(d_pairs.data()),
+                    thrust::raw_pointer_cast(d_single_counter.data()),
+                    int(capacity));
+            } else {
+                launch_single_pass<false>(
+                    source, target, rightmost, target_root, filter_type,
+                    thrust::raw_pointer_cast(d_pairs.data()),
+                    thrust::raw_pointer_cast(d_single_counter.data()),
+                    int(capacity));
+            }
+
+            thrust::copy(
+                d_single_counter.begin(), d_single_counter.end(), &count);
+            if (size_t(count) <= capacity)
+                break;
+            capacity = size_t(count); // exact size known; second pass fits
+        }
+
+        if (count == 0)
+            return {};
+
+        std::vector<CandidatePair> out(count);
+        thrust::copy(d_pairs.begin(), d_pairs.begin() + count, out.begin());
+        return out;
+    }
 };
 
 GPU_LBVH::GPU_LBVH() : BroadPhase(), impl(std::make_unique<Impl>()) {}
@@ -575,10 +1104,94 @@ GPU_LBVH::GPU_LBVH() : BroadPhase(), impl(std::make_unique<Impl>()) {}
 GPU_LBVH::~GPU_LBVH() = default;
 
 void GPU_LBVH::build(
+    Eigen::ConstRef<Eigen::MatrixXd> vertices,
+    Eigen::ConstRef<Eigen::MatrixXi> edges,
+    Eigen::ConstRef<Eigen::MatrixXi> faces,
+    const double inflation_radius)
+{
+    const bool cullable =
+        exact_ee_culling && inflation_radius > 0 && vertices.rows() > 0;
+    const double mu = warm_start_margin;
+    const double dhat = 2 * inflation_radius;
+
+    // Certified warm start: if nothing moved more than mu * dhat / 2 since
+    // the cached build, the cached sets -- built with a (1 + mu) threshold
+    // -- are supersets of the live sets, and the whole build is skipped.
+    if (cullable && mu > 0 && m_cached_inflation == inflation_radius
+        && m_cached_vertices.rows() == vertices.rows()
+        && m_cached_num_edges == edges.rows()
+        && m_cached_num_faces == faces.rows()) {
+        const double max_disp = (vertices - m_cached_vertices)
+                                    .rowwise()
+                                    .norm()
+                                    .maxCoeff();
+        if (2 * max_disp <= mu * dhat) {
+            m_reuse = true;
+            return;
+        }
+    }
+    m_reuse = false;
+
+    if (cullable) {
+        // Production convention: inflation_radius = dhat / 2
+        // (NormalCollisions::build), so the exact threshold is
+        // dhat = 2 * inflation_radius. The margin is the float-conservatism
+        // slack (1e-2) plus the warm-start motion budget (mu). Staged in
+        // class members: BroadPhase::build() calls clear(), which recreates
+        // the Impl, before the protected build consumes this.
+        const double margin = 1e-2 + mu;
+        const double thr = dhat * (1 + margin);
+        m_staged_ee_cull_sq = thr * thr;
+
+        const bool is_3d = vertices.cols() >= 3;
+        m_staged_verts.resize(3 * vertices.rows());
+        for (Eigen::Index i = 0; i < vertices.rows(); ++i) {
+            m_staged_verts[3 * i + 0] = static_cast<float>(vertices(i, 0));
+            m_staged_verts[3 * i + 1] = static_cast<float>(vertices(i, 1));
+            m_staged_verts[3 * i + 2] =
+                is_3d ? static_cast<float>(vertices(i, 2)) : 0.0f;
+        }
+
+        // The tree inflation must also cover (1 + mu) * dhat, or the AABB
+        // stage could prune a pair the certification relies on.
+        BroadPhase::build(
+            vertices, edges, faces, inflation_radius * (1 + margin));
+
+        if (mu > 0) { // after the base build: its clear() resets the cache
+            m_cached_vertices = vertices;
+            m_cached_num_edges = edges.rows();
+            m_cached_num_faces = faces.rows();
+            m_cached_inflation = inflation_radius;
+        }
+        return;
+    }
+
+    BroadPhase::build(vertices, edges, faces, inflation_radius);
+}
+
+void GPU_LBVH::build(
     Eigen::ConstRef<Eigen::MatrixXi> edges,
     Eigen::ConstRef<Eigen::MatrixXi> faces)
 {
     IPC_TOOLKIT_PROFILE_BLOCK("GPU_LBVH::build");
+
+    // Consume the threshold staged by the static build() above; any other
+    // path (dynamic t0/t1 build, build from boxes) leaves culling off.
+    if (m_staged_ee_cull_sq > 0 && !m_staged_verts.empty()) {
+        impl->ee_cull_sq = static_cast<float>(m_staged_ee_cull_sq);
+        thrust::host_vector<float3> h_verts(m_staged_verts.size() / 3);
+        for (size_t i = 0; i < h_verts.size(); ++i) {
+            h_verts[i] = make_float3(
+                m_staged_verts[3 * i + 0], m_staged_verts[3 * i + 1],
+                m_staged_verts[3 * i + 2]);
+        }
+        impl->d_verts = h_verts;
+    } else {
+        impl->ee_cull_sq = -1.0f;
+        impl->d_verts.clear();
+    }
+    m_staged_ee_cull_sq = -1;
+    m_staged_verts.clear();
 
     BroadPhase::build(edges, faces);
 
@@ -642,57 +1255,104 @@ void GPU_LBVH::clear()
 {
     BroadPhase::clear();
     impl = std::make_unique<Impl>();
+    m_reuse = false;
+    m_has_vv = m_has_ev = m_has_ee = m_has_fv = false;
+    m_cached_inflation = -1;
 }
 
 void GPU_LBVH::detect_vertex_vertex_candidates(
     std::vector<VertexVertexCandidate>& candidates) const
 {
+    if (m_reuse && m_has_vv) {
+        candidates.insert(
+            candidates.end(), m_cached_vv.begin(), m_cached_vv.end());
+        return;
+    }
     if (impl->vertex_nodes.size() <= 1)
         return;
     IPC_TOOLKIT_PROFILE_BLOCK("GPU_LBVH::detect_vertex_vertex_candidates");
-    auto pairs = impl->traverse(impl->vertex_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, true, 0);
+    auto pairs = impl->ee_cull_sq >= 0.0f
+        ? impl->traverse_single(impl->vertex_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, true, 0)
+        : impl->traverse(impl->vertex_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, true, 0);
     for (auto& p : pairs) {
         if (can_vertices_collide(p.id_a, p.id_b))
             candidates.emplace_back(p.id_a, p.id_b);
+    }
+    if (warm_start_margin > 0 && impl->ee_cull_sq >= 0.0f) {
+        m_cached_vv = candidates;
+        m_has_vv = true;
     }
 }
 
 void GPU_LBVH::detect_edge_vertex_candidates(
     std::vector<EdgeVertexCandidate>& candidates) const
 {
+    if (m_reuse && m_has_ev) {
+        candidates.insert(
+            candidates.end(), m_cached_ev.begin(), m_cached_ev.end());
+        return;
+    }
     if (!impl->has_edges || !impl->has_vertices)
         return;
     IPC_TOOLKIT_PROFILE_BLOCK("GPU_LBVH::detect_edge_vertex_candidates");
-    auto pairs = impl->traverse(impl->edge_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, false, 1);
+    auto pairs = impl->ee_cull_sq >= 0.0f
+        ? impl->traverse_single(impl->edge_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, false, 1)
+        : impl->traverse(impl->edge_nodes, impl->vertex_nodes, impl->vertex_rightmost, impl->vertex_root, false, 1);
     for (auto& p : pairs) {
         if (can_edge_vertex_collide(p.id_a, p.id_b))
             candidates.emplace_back(p.id_a, p.id_b);
+    }
+    if (warm_start_margin > 0 && impl->ee_cull_sq >= 0.0f) {
+        m_cached_ev = candidates;
+        m_has_ev = true;
     }
 }
 
 void GPU_LBVH::detect_edge_edge_candidates(
     std::vector<EdgeEdgeCandidate>& candidates) const
 {
+    if (m_reuse && m_has_ee) {
+        candidates.insert(
+            candidates.end(), m_cached_ee.begin(), m_cached_ee.end());
+        return;
+    }
     if (impl->edge_nodes.size() <= 1)
         return;
     IPC_TOOLKIT_PROFILE_BLOCK("GPU_LBVH::detect_edge_edge_candidates");
-    auto pairs = impl->traverse(impl->edge_nodes, impl->edge_nodes, impl->edge_rightmost, impl->edge_root, true, 2);
+    auto pairs = impl->ee_cull_sq >= 0.0f
+        ? impl->traverse_single(impl->edge_nodes, impl->edge_nodes, impl->edge_rightmost, impl->edge_root, true, 2)
+        : impl->traverse(impl->edge_nodes, impl->edge_nodes, impl->edge_rightmost, impl->edge_root, true, 2);
     for (auto& p : pairs) {
         if (can_edges_collide(p.id_a, p.id_b))
             candidates.emplace_back(p.id_a, p.id_b);
+    }
+    if (warm_start_margin > 0 && impl->ee_cull_sq >= 0.0f) {
+        m_cached_ee = candidates;
+        m_has_ee = true;
     }
 }
 
 void GPU_LBVH::detect_face_vertex_candidates(
     std::vector<FaceVertexCandidate>& candidates) const
 {
+    if (m_reuse && m_has_fv) {
+        candidates.insert(
+            candidates.end(), m_cached_fv.begin(), m_cached_fv.end());
+        return;
+    }
     if (!impl->has_faces || !impl->has_vertices)
         return;
     IPC_TOOLKIT_PROFILE_BLOCK("GPU_LBVH::detect_face_vertex_candidates");
-    auto pairs = impl->traverse(impl->vertex_nodes, impl->face_nodes, impl->face_rightmost, impl->face_root, false, 3);
+    auto pairs = impl->ee_cull_sq >= 0.0f
+        ? impl->traverse_single(impl->vertex_nodes, impl->face_nodes, impl->face_rightmost, impl->face_root, false, 3)
+        : impl->traverse(impl->vertex_nodes, impl->face_nodes, impl->face_rightmost, impl->face_root, false, 3);
     for (auto& p : pairs) {
         if (can_face_vertex_collide(p.id_b, p.id_a))
             candidates.emplace_back(p.id_b, p.id_a);
+    }
+    if (warm_start_margin > 0 && impl->ee_cull_sq >= 0.0f) {
+        m_cached_fv = candidates;
+        m_has_fv = true;
     }
 }
 
