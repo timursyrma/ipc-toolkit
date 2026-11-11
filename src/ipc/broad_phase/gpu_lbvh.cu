@@ -744,6 +744,128 @@ __global__ void traverse_single_pass_kernel(
     } while (node_idx != -1);
 }
 
+// Fused broad+narrow pass: the traversal computes the exact (double)
+// primitive distance for every surviving leaf pair and accumulates the
+// IPC clamped-log barrier b(d^2) = -(d^2 - dhat^2)^2 * ln(d^2 / dhat^2)
+// directly. No candidate is ever written to memory -- the kernel's only
+// output is one scalar per launch. Supports EE (filter_type 2) and FV
+// (filter_type 3), the 3D barrier pipeline's candidate types.
+template <bool triangular>
+__global__ void traverse_barrier_energy_kernel(
+    const GpuNode* __restrict__ source_bvh,
+    const GpuNode* __restrict__ target_bvh,
+    const int32_t* __restrict__ rightmost_leaves,
+    const int num_source_leaves,
+    const int source_leaf_offset,
+    const int num_target_nodes,
+    const int target_root,
+    const int32_t* __restrict__ edge_v0,
+    const int32_t* __restrict__ edge_v1,
+    const int32_t* __restrict__ face_v0,
+    const int32_t* __restrict__ face_v1,
+    const int32_t* __restrict__ face_v2,
+    const int filter_type,
+    const float3* __restrict__ verts,
+    const float cull_sq, // margined descent/prefilter threshold
+    const double dhat_sq, // exact barrier threshold
+    double* __restrict__ energy_out)
+{
+    const int query_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (query_idx >= num_source_leaves)
+        return;
+
+    const GpuNode& query = source_bvh[source_leaf_offset + query_idx];
+
+    constexpr int MAX_STACK = 64;
+    int stack[MAX_STACK];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = -1;
+
+    int node_idx = target_root;
+    const float cull_dhat = sqrtf(cull_sq);
+    double local = 0.0;
+
+    auto accumulate = [&](int32_t id_a, int32_t id_b) {
+        double d_sq;
+        if (filter_type == 2) {
+            const int32_t ea0 = edge_v0[id_a], ea1 = edge_v1[id_a];
+            const int32_t eb0 = edge_v0[id_b], eb1 = edge_v1[id_b];
+            if (ea0 == eb0 || ea0 == eb1 || ea1 == eb0 || ea1 == eb1)
+                return;
+            if (seg_seg_dist_sq_f(
+                    verts[ea0], verts[ea1], verts[eb0], verts[eb1])
+                > 4.0f * cull_sq) {
+                return; // far beyond the float error band
+            }
+            d_sq = seg_seg_dist_sq(
+                verts[ea0], verts[ea1], verts[eb0], verts[eb1]);
+        } else { // filter_type == 3
+            if (id_a == face_v0[id_b] || id_a == face_v1[id_b]
+                || id_a == face_v2[id_b])
+                return;
+            if (pt_tri_dist_sq_t<float>(
+                    verts[id_a], verts[face_v0[id_b]], verts[face_v1[id_b]],
+                    verts[face_v2[id_b]])
+                > 4.0f * cull_sq) {
+                return;
+            }
+            d_sq = pt_tri_dist_sq_t<double>(
+                verts[id_a], verts[face_v0[id_b]], verts[face_v1[id_b]],
+                verts[face_v2[id_b]]);
+        }
+        if (d_sq < dhat_sq && d_sq > 0.0) {
+            const double g = d_sq - dhat_sq;
+            local += -g * g * log(d_sq / dhat_sq);
+        }
+    };
+
+    do {
+        if (num_target_nodes == 1) {
+            if (!triangular && gpu_nodes_within(query, target_bvh[0], cull_dhat)) {
+                accumulate(query.primitive_id, target_bvh[0].primitive_id);
+            }
+            break;
+        }
+
+        const GpuNode& node = target_bvh[node_idx];
+        const GpuNode& child_l = target_bvh[node.left];
+        const GpuNode& child_r = target_bvh[node.right];
+
+        bool hit_l = gpu_nodes_within(query, child_l, cull_dhat);
+        bool hit_r = gpu_nodes_within(query, child_r, cull_dhat);
+
+        if constexpr (triangular) {
+            if (hit_l && rightmost_leaves[node.left] <= query_idx)
+                hit_l = false;
+            if (hit_r && rightmost_leaves[node.right] <= query_idx)
+                hit_r = false;
+        }
+
+        if (hit_l && gpu_node_is_leaf(child_l)) {
+            accumulate(query.primitive_id, child_l.primitive_id);
+        }
+        if (hit_r && gpu_node_is_leaf(child_r)) {
+            accumulate(query.primitive_id, child_r.primitive_id);
+        }
+
+        const bool traverse_l = hit_l && gpu_node_is_inner(child_l);
+        const bool traverse_r = hit_r && gpu_node_is_inner(child_r);
+
+        if (!traverse_l && !traverse_r) {
+            node_idx = stack[--stack_ptr];
+        } else {
+            node_idx = traverse_l ? node.left : node.right;
+            if (traverse_l && traverse_r) {
+                stack[stack_ptr++] = node.right;
+            }
+        }
+    } while (node_idx != -1);
+
+    if (local != 0.0) {
+        atomicAdd(energy_out, local);
+    }
+}
+
 } // anonymous namespace
 
 struct GPU_LBVH::Impl {
@@ -787,6 +909,7 @@ struct GPU_LBVH::Impl {
     mutable thrust::device_vector<int32_t> d_offsets;
     mutable thrust::device_vector<CandidatePair> d_pairs;
     mutable thrust::device_vector<int> d_single_counter;
+    mutable thrust::device_vector<double> d_energy;
 
     void build_bvh(
         const AABBs& boxes,
@@ -1097,6 +1220,68 @@ struct GPU_LBVH::Impl {
         thrust::copy(d_pairs.begin(), d_pairs.begin() + count, out.begin());
         return out;
     }
+
+    /// Fused broad+narrow barrier energy over one candidate type; nothing
+    /// but the scalar leaves the device. Requires the culling state
+    /// (ee_cull_sq, d_verts) from an exact_ee_culling build.
+    double barrier_energy(
+        const thrust::device_vector<GpuNode>& source,
+        const thrust::device_vector<GpuNode>& target,
+        const thrust::device_vector<int32_t>& rightmost,
+        int target_root,
+        bool triangular,
+        int filter_type,
+        double dhat_sq) const
+    {
+        if (source.empty() || target.empty())
+            return 0.0;
+
+        const int source_leaf_offset = source.size() / 2;
+        const int num_source_leaves = source_leaf_offset + 1;
+        const int num_target_nodes = target.size();
+        const int block = 256;
+        const int grid = (num_source_leaves + block - 1) / block;
+
+        d_energy.resize(1);
+        thrust::fill(d_energy.begin(), d_energy.end(), 0.0);
+
+        if (triangular) {
+            traverse_barrier_energy_kernel<true><<<grid, block>>>(
+                thrust::raw_pointer_cast(source.data()),
+                thrust::raw_pointer_cast(target.data()),
+                thrust::raw_pointer_cast(rightmost.data()),
+                num_source_leaves, source_leaf_offset, num_target_nodes,
+                target_root,
+                d_edge_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v0.data()),
+                d_edge_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v1.data()),
+                d_face_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v0.data()),
+                d_face_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v1.data()),
+                d_face_v2.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v2.data()),
+                filter_type,
+                thrust::raw_pointer_cast(d_verts.data()), ee_cull_sq,
+                dhat_sq, thrust::raw_pointer_cast(d_energy.data()));
+        } else {
+            traverse_barrier_energy_kernel<false><<<grid, block>>>(
+                thrust::raw_pointer_cast(source.data()),
+                thrust::raw_pointer_cast(target.data()),
+                thrust::raw_pointer_cast(rightmost.data()),
+                num_source_leaves, source_leaf_offset, num_target_nodes,
+                target_root,
+                d_edge_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v0.data()),
+                d_edge_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_edge_v1.data()),
+                d_face_v0.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v0.data()),
+                d_face_v1.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v1.data()),
+                d_face_v2.empty() ? nullptr : thrust::raw_pointer_cast(d_face_v2.data()),
+                filter_type,
+                thrust::raw_pointer_cast(d_verts.data()), ee_cull_sq,
+                dhat_sq, thrust::raw_pointer_cast(d_energy.data()));
+        }
+        cudaDeviceSynchronize();
+
+        double h = 0.0;
+        thrust::copy(d_energy.begin(), d_energy.end(), &h);
+        return h;
+    }
 };
 
 GPU_LBVH::GPU_LBVH() : BroadPhase(), impl(std::make_unique<Impl>()) {}
@@ -1258,6 +1443,28 @@ void GPU_LBVH::clear()
     m_reuse = false;
     m_has_vv = m_has_ev = m_has_ee = m_has_fv = false;
     m_cached_inflation = -1;
+}
+
+double GPU_LBVH::fused_barrier_potential(const double dhat) const
+{
+    if (impl->ee_cull_sq < 0.0f) {
+        throw std::runtime_error(
+            "GPU_LBVH::fused_barrier_potential requires a static build with "
+            "exact_ee_culling = true and inflation_radius > 0");
+    }
+    const double dhat_sq = dhat * dhat;
+    double energy = 0.0;
+    if (impl->edge_nodes.size() > 1) {
+        energy += impl->barrier_energy(
+            impl->edge_nodes, impl->edge_nodes, impl->edge_rightmost,
+            impl->edge_root, true, 2, dhat_sq);
+    }
+    if (impl->has_faces && impl->has_vertices) {
+        energy += impl->barrier_energy(
+            impl->vertex_nodes, impl->face_nodes, impl->face_rightmost,
+            impl->face_root, false, 3, dhat_sq);
+    }
+    return energy;
 }
 
 void GPU_LBVH::detect_vertex_vertex_candidates(

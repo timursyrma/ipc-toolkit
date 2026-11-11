@@ -274,6 +274,81 @@ int main(int argc, char* argv[])
                 ev_live, ev.size() >= ev_live ? "" : "  LOST!");
         }
 
+        // --- Fused broad+narrow barrier energy (zero materialization) -----
+        {
+            // CPU reference: the same clamped-log barrier summed over the
+            // live pairs of the CPU candidate sets, all in double.
+            auto barrier = [&](double d_sq) {
+                if (d_sq >= dhat_sq || d_sq <= 0.0) {
+                    return 0.0;
+                }
+                const double g = d_sq - dhat_sq;
+                return -g * g * std::log(d_sq / dhat_sq);
+            };
+            double e_ref = 0.0;
+            for (const auto& c : ee0) {
+                e_ref += barrier(edge_edge_distance(
+                    V0.row(E(c.edge0_id, 0)), V0.row(E(c.edge0_id, 1)),
+                    V0.row(E(c.edge1_id, 0)), V0.row(E(c.edge1_id, 1))));
+            }
+            for (const auto& c : fv0) {
+                e_ref += barrier(point_triangle_distance(
+                    V0.row(c.vertex_id), V0.row(F0(c.face_id, 0)),
+                    V0.row(F0(c.face_id, 1)), V0.row(F0(c.face_id, 2))));
+            }
+
+            GPU_LBVH bp;
+            bp.exact_ee_culling = true;
+            bp.build(V0, E, F0, 0.5 * dhat);
+            double e_fused = bp.fused_barrier_potential(dhat); // warm-up
+
+            constexpr int SAMPLES = 5;
+            auto t0 = Clock::now();
+            for (int i = 0; i < SAMPLES; ++i) {
+                e_fused = bp.fused_barrier_potential(dhat);
+            }
+            auto t1 = Clock::now();
+            const double fused_ms =
+                std::chrono::duration<double, std::milli>(t1 - t0).count()
+                / SAMPLES;
+
+            // Pipeline baseline: culled detect (EE + FV) to host, then the
+            // same barrier loop on the host over the returned candidates.
+            t0 = Clock::now();
+            double e_pipe = 0.0;
+            for (int i = 0; i < SAMPLES; ++i) {
+                std::vector<EdgeEdgeCandidate> ee;
+                bp.detect_edge_edge_candidates(ee);
+                std::vector<FaceVertexCandidate> fv;
+                bp.detect_face_vertex_candidates(fv);
+                e_pipe = 0.0;
+                for (const auto& c : ee) {
+                    e_pipe += barrier(edge_edge_distance(
+                        V0.row(E(c.edge0_id, 0)), V0.row(E(c.edge0_id, 1)),
+                        V0.row(E(c.edge1_id, 0)), V0.row(E(c.edge1_id, 1))));
+                }
+                for (const auto& c : fv) {
+                    e_pipe += barrier(point_triangle_distance(
+                        V0.row(c.vertex_id), V0.row(F0(c.face_id, 0)),
+                        V0.row(F0(c.face_id, 1)), V0.row(F0(c.face_id, 2))));
+                }
+            }
+            t1 = Clock::now();
+            const double pipe_ms =
+                std::chrono::duration<double, std::milli>(t1 - t0).count()
+                / SAMPLES;
+
+            const double rel = e_ref != 0.0
+                ? std::abs(e_fused - e_ref) / std::abs(e_ref)
+                : std::abs(e_fused);
+            printf(
+                "  FUSED: E=%.6e (ref %.6e, rel.diff=%.1e)  fused=%.2f ms "
+                "vs pipeline=%.2f ms (%.1fx), bytes avoided=%zu\n",
+                e_fused, e_ref, rel, fused_ms, pipe_ms,
+                fused_ms > 0 ? pipe_ms / fused_ms : 0.0,
+                16 * (n_exact + fv_exact));
+        }
+
         // --- Warm start: certified reuse under small motion ---------------
         {
             const double mu = 0.5;

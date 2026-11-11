@@ -45,6 +45,20 @@ public:
     /// @brief Whether the last static build() reused the cached candidates.
     bool last_build_reused() const { return m_reuse; }
 
+    /// @brief Experimental fused broad+narrow pass: the clamped-log barrier
+    /// potential sum(-(d^2 - dhat^2)^2 * ln(d^2 / dhat^2)) over all EE and
+    /// FV pairs within dhat, computed inside the BVH traversal itself.
+    ///
+    /// No candidate list is ever materialized -- on the device or the host;
+    /// the only output is the scalar. Requires a static build() with
+    /// exact_ee_culling = true and inflation_radius = dhat / 2 (the
+    /// production convention), and assumes the accept-all vertex filter.
+    /// Distances are evaluated in double from the float-cast vertex
+    /// positions; pairs at the dhat boundary contribute ~0 by construction,
+    /// so the float cast does not destabilize the sum. The EE term carries
+    /// no parallel-edge mollifier.
+    double fused_barrier_potential(double dhat) const;
+
     using BroadPhase::build;
 
     void build(
